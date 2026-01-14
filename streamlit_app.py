@@ -138,4 +138,4 @@ else:
                 st.markdown(html.unescape(summary), unsafe_allow_html=True)
 
             st.divider()
-``
+
