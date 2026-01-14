@@ -7,11 +7,12 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-UPDATES_URL = "https://azure.microsoft.com/en-us/updates/"
+# Filtered "Launched" URL
+UPDATES_URL = 'https://azure.microsoft.com/en-us/updates?filters=["Launched"]'
 
 st.set_page_config(page_title="Azure Updates — Launched", page_icon="🚀", layout="wide")
 st.title("🚀 Azure Updates — Launched (Newest → Oldest)")
-st.caption("Source: Azure Updates webpage (scraped)")
+st.caption("Source: Azure Updates (filtered to Launched)")
 
 # ----------------------------- Helpers ----------------------------------------
 @st.cache_data(ttl=60 * 30)  # cache for 30 minutes
@@ -25,7 +26,7 @@ def parse_updates(html_text: str):
     """
     Parse the Azure Updates page and return a list of dicts:
     {
-      'status': 'Launched' | 'In preview' | ...,
+      'status': 'Launched',
       'title': str,
       'date': datetime (UTC),
       'tags': [str],
@@ -34,55 +35,66 @@ def parse_updates(html_text: str):
     }
     """
     soup = BeautifulSoup(html_text, "html.parser")
-
-    # The page is built with cards; selectors may change if Microsoft updates the markup.
-    # We'll search generically for card-like elements that include status, title, date.
     updates = []
 
-    # Common containers: divs with data attributes or known classes.
-    # Try several patterns to be robust.
-    # Pattern A: Modern card list items
-    card_candidates = soup.select("li, div")
-    for el in card_candidates:
-        # Identify card elements by the presence of a status label and title link
-        status_el = el.select_one('[class*="status"], [class*="Status"], .status, .azure-status, .update-status')
-        title_el = el.select_one("a[href*='/updates/'], a[href*='azure.microsoft.com/en-us/updates']")
-        date_el = el.find(lambda tag: tag.name in ["time", "div", "span"] and ("date" in (tag.get("class") or []) or re.search(r"\b\d{4}\b", tag.get_text(strip=True) or "")))
-        desc_el = el.select_one("p, .description, [class*='description'], [class*='summary']")
-
-        if not title_el or not status_el:
+    # Heuristic selectors for update cards.
+    # Microsoft may change classes/structure; adjust if needed.
+    # Strategy: find anchors to individual update pages, then walk up to the card container.
+    for a in soup.select('a[href*="/updates/"]'):
+        title = a.get_text(strip=True)
+        href = a.get("href", "")
+        if not title or not href:
             continue
 
-        # Extract fields
-        status = status_el.get_text(strip=True)
-        title = title_el.get_text(strip=True)
-        link = title_el.get("href", "")
-        if link and link.startswith("/"):
-            link = "https://azure.microsoft.com" + link
+        link = href if href.startswith("http") else "https://azure.microsoft.com" + href
 
-        # Tags/categories (optional—often shown as chips)
-        tag_els = el.select('[class*="tag"], [class*="chip"], .azure-tag, .category, a[href*="/topics/"]')
+        # Card container (walk up a few levels)
+        container = a
+        for _ in range(3):
+            if container and container.parent:
+                container = container.parent
+
+        # Status label (page is pre-filtered to Launched, but we read it anyway)
+        status_el = None
+        # Common status class names
+        for sel in ('.status', '[class*="status"]', '.azure-status', '.update-status'):
+            status_el = container.select_one(sel)
+            if status_el:
+                break
+        status = (status_el.get_text(strip=True) if status_el else "Launched")
+
+        # Date element (try <time> first)
+        date_dt = datetime.fromtimestamp(0, tz=timezone.utc)
+        date_el = container.select_one("time")
+        if date_el and date_el.get("datetime"):
+            try:
+                date_dt = datetime.fromisoformat(date_el["datetime"].replace("Z", "+00:00"))
+            except Exception:
+                pass
+        else:
+            # Fallback: text-based date inside spans/divs
+            date_text_el = container.find(lambda tag: tag.name in ["div", "span"] and re.search(r"\b\d{4}\b", tag.get_text(strip=True) or ""))
+            dt_text = date_text_el.get_text(strip=True) if date_text_el else ""
+            parsed = None
+            for fmt in ("%b %d, %Y", "%B %d, %Y", "%B %Y", "%b %Y", "%Y-%m-%d"):
+                try:
+                    parsed = datetime.strptime(dt_text, fmt).replace(tzinfo=timezone.utc)
+                    break
+                except Exception:
+                    continue
+            date_dt = parsed or date_dt
+
+        # Tags
+        tag_els = container.select('[class*="tag"], [class*="chip"], .category, a[href*="/topics/"]')
         tags = list({t.get_text(strip=True) for t in tag_els if t.get_text(strip=True)})
 
-        # Parse date (Azure Updates cards print human-readable dates; fallback to now if absent)
-        date_dt = None
-        dt_text = ""
-        if date_el:
-            dt_text = date_el.get_text(strip=True)
-        # Try strong patterns like 'December 2025', 'Dec 5, 2025', etc.
-        parsed = None
-        for fmt in ("%b %d, %Y", "%B %d, %Y", "%B %Y", "%b %Y", "%Y-%m-%d"):
-            try:
-                parsed = datetime.strptime(dt_text, fmt).replace(tzinfo=timezone.utc)
+        # Description/summary block
+        desc_el = None
+        for sel in ("p", ".description", "[class*='description']", "[class*='summary']"):
+            desc_el = container.select_one(sel)
+            if desc_el:
                 break
-            except Exception:
-                continue
-        date_dt = parsed or datetime.fromtimestamp(0, tz=timezone.utc)
-
-        description_html = ""
-        if desc_el:
-            # Keep original HTML fragment for richer rendering
-            description_html = str(desc_el)
+        description_html = str(desc_el) if desc_el else ""
 
         updates.append({
             "status": status,
@@ -99,7 +111,7 @@ def is_launched(status_text: str) -> bool:
     return bool(re.search(r"\blaunched\b", (status_text or "").lower()))
 
 # ----------------------------- Fetch & Parse ----------------------------------
-with st.spinner("Fetching Azure Updates page…"):
+with st.spinner("Fetching Azure Updates (Launched)…"):
     try:
         html_text = fetch_updates_page(UPDATES_URL)
     except Exception as e:
@@ -108,7 +120,9 @@ with st.spinner("Fetching Azure Updates page…"):
 
 updates = parse_updates(html_text)
 
-launched = [u for u in updates if is_launched(u.get("status", ""))]
+# Even though the page is pre-filtered, double-check status.
+launched = [u for u in updates if is_launched(u.get("status", "Launched"))]
+# Sort newest → oldest
 launched.sort(key=lambda x: x["date"], reverse=True)
 
 # ----------------------------- Header -----------------------------------------
@@ -118,7 +132,7 @@ with cols[0]:
 with cols[1]:
     st.caption(f"Scraped at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 with cols[2]:
-    st.caption("If Microsoft changes the page layout, selectors may need updates.")
+    st.caption("If Microsoft changes the page layout or filters, selectors may need updates.")
 
 st.divider()
 
@@ -129,7 +143,7 @@ else:
     for u in launched:
         with st.container():
             st.subheader(u["title"])
-            meta_cols = st.columns([1.2, 1, 2])
+            meta_cols = st.columns([1.3, 1, 2])
             with meta_cols[0]:
                 if u["link"]:
                     st.markdown(f"**Link:** {u['link']}")
