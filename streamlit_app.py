@@ -13,6 +13,15 @@ st.set_page_config(page_title="Azure Updates — Launched", page_icon="🚀", la
 st.title("🚀 Azure Updates — Launched (Newest → Oldest)")
 st.caption("Source: Microsoft Release Communications (Azure) RSS")
 
+# ---- Controls ----------------------------------------------------------------
+st.sidebar.header("Options")
+attempt_http_fulltext = st.sidebar.checkbox(
+    "Try to fetch full text from article page when feed lacks it",
+    value=False,
+    help="If the RSS item doesn't include full content, try retrieving the main text from the linked page."
+)
+
+
 # ---- Helper functions --------------------------------------------------------
 @st.cache_data(ttl=60 * 30)  # cache for 30 minutes
 def fetch_feed(url: str):
@@ -47,7 +56,6 @@ def is_launched(entry):
 
     # Check categories/tags
     for t in tags:
-        # feedparser normalizes tags with "term"
         term = (t.get("term") or "").lower()
         if term == "launched":
             return True
@@ -62,21 +70,77 @@ def entry_published_dt(entry):
     """
     Robustly get publication datetime (UTC). If missing, return epoch 0 for sorting last.
     """
-    # feedparser may provide 'published_parsed' as time.struct_time
     if entry.get("published_parsed"):
         return datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc)
-    # Some feeds use 'updated_parsed'
     if entry.get("updated_parsed"):
         return datetime.fromtimestamp(time.mktime(entry.updated_parsed), tz=timezone.utc)
-    # If only ISO strings present
     for key in ("published", "updated"):
         if entry.get(key):
             try:
-                # Attempt to parse common ISO formats
                 return datetime.fromisoformat(entry[key].replace("Z", "+00:00")).astimezone(timezone.utc)
             except Exception:
                 pass
     return datetime.fromtimestamp(0, tz=timezone.utc)
+
+@st.cache_data(ttl=60 * 30)
+def fetch_page(url: str) -> str:
+    """
+    Fetch raw HTML from a page with a short timeout.
+    """
+    headers = {
+        "User-Agent": "Streamlit-App (Azure-Updates-Launched)"
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+def extract_fulltext_from_entry(entry) -> str:
+    """
+    Prefer full text from the feed (e.g., content:encoded via feedparser -> entry.content[].value).
+    Fallback to summary. Optionally attempt best-effort page extraction.
+    """
+    # 1) Prefer content:encoded (feedparser exposes it via entry.content if available)
+    content_blocks = entry.get("content") or []
+    for c in content_blocks:
+        val = c.get("value", "")
+        if val and val.strip():
+            # Full text often includes HTML; return as-is
+            return val
+
+    # 2) Fallback to summary from the feed
+    summary = entry.get("summary", "")
+    if summary and summary.strip():
+        return summary
+
+    # 3) Optional: fetch linked page and attempt a simple heuristic extraction
+    if attempt_http_fulltext:
+        url = entry.get("link") or entry.get("id") or ""
+        if url:
+            try:
+                html_text = fetch_page(url)
+
+                # --- Simple heuristic ---
+                # Try to locate main content blocks likely used on Azure Updates pages.
+                # This is intentionally minimal (no heavy parsing libs) to keep requirements light.
+                # We search for article-like sections and remove script/style tags.
+                cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", html_text)
+                # Try to find a main content region by common containers
+                candidates = re.findall(
+                    r'(?is)<(article|main|section|div)[^>]*(?:id|class)="[^"]*(content|article|main|post|update)[^"]*"[^>]*>(.*?)</\\1>',
+                    cleaned
+                )
+                if candidates:
+                    # Pick the largest candidate body
+                    largest = max(candidates, key=lambda x: len(x[2]))[2]
+                    return largest
+
+                # If no match, return the entire cleaned HTML (last resort)
+                return cleaned
+            except Exception:
+                pass
+
+    # 4) Nothing usable
+    return ""
 
 # ---- Fetch and filter --------------------------------------------------------
 with st.spinner("Fetching Azure 'Launched' updates…"):
@@ -88,15 +152,13 @@ with st.spinner("Fetching Azure 'Launched' updates…"):
         st.stop()
 
 launched_entries = [e for e in entries if is_launched(e)]
-# Sort newest → oldest by published date
 launched_entries.sort(key=entry_published_dt, reverse=True)
 
-# ---- Controls ----------------------------------------------------------------
+# ---- Header stats ------------------------------------------------------------
 left, right = st.columns([1, 1])
 with left:
     st.metric("Launched items", len(launched_entries))
 with right:
-    # Show last updated time from the feed if present, else now
     last_build = feed.get("feed", {}).get("updated") or feed.get("feed", {}).get("published")
     last_build_dt = None
     if last_build:
@@ -118,7 +180,6 @@ else:
         pub_dt = entry_published_dt(e)
         title = e.get("title", "Untitled")
         link = e.get("link") or e.get("id") or ""
-        summary = e.get("summary", "")
         tags = ", ".join([t.get("term", "") for t in e.get("tags", []) if t.get("term")])
 
         with st.container():
@@ -126,16 +187,17 @@ else:
             meta_cols = st.columns([1.2, 1, 1])
             with meta_cols[0]:
                 if link:
-                    st.markdown(f"**Link:** [{link}]({link})")
+                    st.markdown(f"**Link:** {link}")
             with meta_cols[1]:
                 st.markdown(f"**Published:** {pub_dt.strftime('%Y-%m-%d %H:%M UTC')}")
             with meta_cols[2]:
                 if tags:
                     st.markdown(f"**Tags:** {tags}")
 
-            if summary:
-                # Summaries may contain HTML; lightly sanitize/unescape
-                st.markdown(html.unescape(summary), unsafe_allow_html=True)
+            full_text_html = extract_fulltext_from_entry(e)
+            if full_text_html and full_text_html.strip():
+                st.markdown(html.unescape(full_text_html), unsafe_allow_html=True)
+            else:
+                st.warning("No full text available for this item.")
 
             st.divider()
-
