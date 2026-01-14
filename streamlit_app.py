@@ -9,8 +9,8 @@ from bs4 import BeautifulSoup
 RSS_URL = 'https://www.microsoft.com/releasecommunications/api/v2/azure/rss'
 
 st.set_page_config(page_title="Azure Updates — Launched", page_icon="🚀", layout="wide")
-st.title("🚀 Azure Updates — All Updates (Newest → Oldest)")
-st.caption("Source: Azure Release Communications RSS Feed")
+st.title("🚀 Azure Updates — Launched (Newest → Oldest)")
+st.caption("Source: Azure Release Communications RSS Feed - Filtered to [Launched] only")
 
 # ----------------------------- Helpers ----------------------------------------
 @st.cache_data(ttl=60 * 30, show_spinner=False)  # cache for 30 minutes
@@ -119,19 +119,14 @@ with st.spinner("Fetching Azure Updates from RSS feed…"):
 # Parse all entries
 updates = [parse_feed_entry(entry) for entry in feed.entries]
 
+# Filter for only items with [Launched] in title
+updates = [u for u in updates if '[Launched]' in u['title']]
+
 # Sort by date (newest first)
 updates.sort(key=lambda x: x['date'], reverse=True)
 
 # ----------------------------- Filters ----------------------------------------
 st.sidebar.header("🔍 Filters")
-
-# Status filter
-all_statuses = sorted(set(u['status'] for u in updates))
-selected_statuses = st.sidebar.multiselect(
-    "Filter by Status",
-    options=all_statuses,
-    default=all_statuses
-)
 
 # Date range filter
 if updates:
@@ -157,9 +152,6 @@ search_query = st.sidebar.text_input("🔎 Search in title/description")
 # Apply filters
 filtered_updates = updates
 
-if selected_statuses:
-    filtered_updates = [u for u in filtered_updates if u['status'] in selected_statuses]
-
 if updates:
     filtered_updates = [
         u for u in filtered_updates 
@@ -176,7 +168,7 @@ if search_query:
 # ----------------------------- Header -----------------------------------------
 cols = st.columns([1, 1, 1, 1])
 with cols[0]:
-    st.metric("Total Updates", len(updates))
+    st.metric("Launched Updates", len(updates))
 with cols[1]:
     st.metric("Filtered", len(filtered_updates))
 with cols[2]:
@@ -238,4 +230,5 @@ else:
 # ----------------------------- Footer -----------------------------------------
 st.sidebar.divider()
 st.sidebar.caption(f"💾 Data cached for 30 minutes")
-st.sidebar.caption(f"📊 Feed contains {len(feed.entries)} total entries")
+st.sidebar.caption(f"📊 {len(updates)} launched updates found")
+st.sidebar.caption(f"🔍 Showing only items with [Launched] in title")
