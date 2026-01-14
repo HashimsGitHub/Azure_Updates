@@ -1,3 +1,5 @@
 streamlit
 feedparser
 requests
+beautifulsoup
+lxml

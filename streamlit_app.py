@@ -3,201 +3,145 @@ import time
 from datetime import datetime, timezone
 import html
 import re
-import feedparser
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 
-FEED_URL = "https://www.microsoft.com/releasecommunications/api/v2/azure/rss"
+UPDATES_URL = "https://azure.microsoft.com/en-us/updates/"
 
 st.set_page_config(page_title="Azure Updates — Launched", page_icon="🚀", layout="wide")
 st.title("🚀 Azure Updates — Launched (Newest → Oldest)")
-st.caption("Source: Microsoft Release Communications (Azure) RSS")
+st.caption("Source: Azure Updates webpage (scraped)")
 
-# ---- Controls ----------------------------------------------------------------
-st.sidebar.header("Options")
-attempt_http_fulltext = st.sidebar.checkbox(
-    "Try to fetch full text from article page when feed lacks it",
-    value=False,
-    help="If the RSS item doesn't include full content, try retrieving the main text from the linked page."
-)
-
-
-# ---- Helper functions --------------------------------------------------------
+# ----------------------------- Helpers ----------------------------------------
 @st.cache_data(ttl=60 * 30)  # cache for 30 minutes
-def fetch_feed(url: str):
-    """
-    Fetch RSS with a short timeout, return feedparser-parsed structure.
-    """
-    headers = {
-        "User-Agent": "Streamlit-App (Azure-Updates-Launched)"
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
+def fetch_updates_page(url: str) -> str:
+    headers = {"User-Agent": "Streamlit-App (Azure-Updates-Launched)"}
+    resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
-    return feedparser.parse(resp.content)
+    return resp.text
 
-def is_launched(entry):
+def parse_updates(html_text: str):
     """
-    Determine if entry is 'Launched'.
-    Strategy:
-      1) Check entry title prefix like '[Launched] ...'
-      2) Check tags/categories if present.
-      3) Fallback: look for 'Launched' anywhere in title or summary.
-    """
-    title = entry.get("title", "") or ""
-    summary = entry.get("summary", "") or ""
-    tags = entry.get("tags", []) or []
-
-    title_clean = title.strip()
-    summary_clean = summary.strip()
-
-    # Some entries come with a status prefix in square brackets.
-    if title_clean.lower().startswith("[launched]") or "[Launched]" in title_clean:
-        return True
-
-    # Check categories/tags
-    for t in tags:
-        term = (t.get("term") or "").lower()
-        if term == "launched":
-            return True
-
-    # Fallback heuristic
-    if re.search(r"\blaunched\b", title_clean.lower()) or re.search(r"\blaunched\b", summary_clean.lower()):
-        return True
-
-    return False
-
-def entry_published_dt(entry):
-    """
-    Robustly get publication datetime (UTC). If missing, return epoch 0 for sorting last.
-    """
-    if entry.get("published_parsed"):
-        return datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc)
-    if entry.get("updated_parsed"):
-        return datetime.fromtimestamp(time.mktime(entry.updated_parsed), tz=timezone.utc)
-    for key in ("published", "updated"):
-        if entry.get(key):
-            try:
-                return datetime.fromisoformat(entry[key].replace("Z", "+00:00")).astimezone(timezone.utc)
-            except Exception:
-                pass
-    return datetime.fromtimestamp(0, tz=timezone.utc)
-
-@st.cache_data(ttl=60 * 30)
-def fetch_page(url: str) -> str:
-    """
-    Fetch raw HTML from a page with a short timeout.
-    """
-    headers = {
-        "User-Agent": "Streamlit-App (Azure-Updates-Launched)"
+    Parse the Azure Updates page and return a list of dicts:
+    {
+      'status': 'Launched' | 'In preview' | ...,
+      'title': str,
+      'date': datetime (UTC),
+      'tags': [str],
+      'link': str,
+      'description_html': str
     }
-    r = requests.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
-    return r.text
-
-def extract_fulltext_from_entry(entry) -> str:
     """
-    Prefer full text from the feed (e.g., content:encoded via feedparser -> entry.content[].value).
-    Fallback to summary. Optionally attempt best-effort page extraction.
-    """
-    # 1) Prefer content:encoded (feedparser exposes it via entry.content if available)
-    content_blocks = entry.get("content") or []
-    for c in content_blocks:
-        val = c.get("value", "")
-        if val and val.strip():
-            # Full text often includes HTML; return as-is
-            return val
+    soup = BeautifulSoup(html_text, "html.parser")
 
-    # 2) Fallback to summary from the feed
-    summary = entry.get("summary", "")
-    if summary and summary.strip():
-        return summary
+    # The page is built with cards; selectors may change if Microsoft updates the markup.
+    # We'll search generically for card-like elements that include status, title, date.
+    updates = []
 
-    # 3) Optional: fetch linked page and attempt a simple heuristic extraction
-    if attempt_http_fulltext:
-        url = entry.get("link") or entry.get("id") or ""
-        if url:
+    # Common containers: divs with data attributes or known classes.
+    # Try several patterns to be robust.
+    # Pattern A: Modern card list items
+    card_candidates = soup.select("li, div")
+    for el in card_candidates:
+        # Identify card elements by the presence of a status label and title link
+        status_el = el.select_one('[class*="status"], [class*="Status"], .status, .azure-status, .update-status')
+        title_el = el.select_one("a[href*='/updates/'], a[href*='azure.microsoft.com/en-us/updates']")
+        date_el = el.find(lambda tag: tag.name in ["time", "div", "span"] and ("date" in (tag.get("class") or []) or re.search(r"\b\d{4}\b", tag.get_text(strip=True) or "")))
+        desc_el = el.select_one("p, .description, [class*='description'], [class*='summary']")
+
+        if not title_el or not status_el:
+            continue
+
+        # Extract fields
+        status = status_el.get_text(strip=True)
+        title = title_el.get_text(strip=True)
+        link = title_el.get("href", "")
+        if link and link.startswith("/"):
+            link = "https://azure.microsoft.com" + link
+
+        # Tags/categories (optional—often shown as chips)
+        tag_els = el.select('[class*="tag"], [class*="chip"], .azure-tag, .category, a[href*="/topics/"]')
+        tags = list({t.get_text(strip=True) for t in tag_els if t.get_text(strip=True)})
+
+        # Parse date (Azure Updates cards print human-readable dates; fallback to now if absent)
+        date_dt = None
+        dt_text = ""
+        if date_el:
+            dt_text = date_el.get_text(strip=True)
+        # Try strong patterns like 'December 2025', 'Dec 5, 2025', etc.
+        parsed = None
+        for fmt in ("%b %d, %Y", "%B %d, %Y", "%B %Y", "%b %Y", "%Y-%m-%d"):
             try:
-                html_text = fetch_page(url)
-
-                # --- Simple heuristic ---
-                # Try to locate main content blocks likely used on Azure Updates pages.
-                # This is intentionally minimal (no heavy parsing libs) to keep requirements light.
-                # We search for article-like sections and remove script/style tags.
-                cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", html_text)
-                # Try to find a main content region by common containers
-                candidates = re.findall(
-                    r'(?is)<(article|main|section|div)[^>]*(?:id|class)="[^"]*(content|article|main|post|update)[^"]*"[^>]*>(.*?)</\\1>',
-                    cleaned
-                )
-                if candidates:
-                    # Pick the largest candidate body
-                    largest = max(candidates, key=lambda x: len(x[2]))[2]
-                    return largest
-
-                # If no match, return the entire cleaned HTML (last resort)
-                return cleaned
+                parsed = datetime.strptime(dt_text, fmt).replace(tzinfo=timezone.utc)
+                break
             except Exception:
-                pass
+                continue
+        date_dt = parsed or datetime.fromtimestamp(0, tz=timezone.utc)
 
-    # 4) Nothing usable
-    return ""
+        description_html = ""
+        if desc_el:
+            # Keep original HTML fragment for richer rendering
+            description_html = str(desc_el)
 
-# ---- Fetch and filter --------------------------------------------------------
-with st.spinner("Fetching Azure 'Launched' updates…"):
+        updates.append({
+            "status": status,
+            "title": title,
+            "date": date_dt,
+            "tags": tags,
+            "link": link,
+            "description_html": description_html
+        })
+
+    return updates
+
+def is_launched(status_text: str) -> bool:
+    return bool(re.search(r"\blaunched\b", (status_text or "").lower()))
+
+# ----------------------------- Fetch & Parse ----------------------------------
+with st.spinner("Fetching Azure Updates page…"):
     try:
-        feed = fetch_feed(FEED_URL)
-        entries = feed.get("entries", []) or []
+        html_text = fetch_updates_page(UPDATES_URL)
     except Exception as e:
-        st.error(f"Failed to load RSS: {e}")
+        st.error(f"Failed to load the updates page: {e}")
         st.stop()
 
-launched_entries = [e for e in entries if is_launched(e)]
-launched_entries.sort(key=entry_published_dt, reverse=True)
+updates = parse_updates(html_text)
 
-# ---- Header stats ------------------------------------------------------------
-left, right = st.columns([1, 1])
-with left:
-    st.metric("Launched items", len(launched_entries))
-with right:
-    last_build = feed.get("feed", {}).get("updated") or feed.get("feed", {}).get("published")
-    last_build_dt = None
-    if last_build:
-        try:
-            last_build_dt = datetime.fromisoformat(last_build.replace("Z", "+00:00"))
-        except Exception:
-            pass
-    st.caption(
-        f"Last feed update: {last_build_dt.isoformat() if last_build_dt else datetime.now(timezone.utc).isoformat()}"
-    )
+launched = [u for u in updates if is_launched(u.get("status", ""))]
+launched.sort(key=lambda x: x["date"], reverse=True)
+
+# ----------------------------- Header -----------------------------------------
+cols = st.columns([1, 1, 2])
+with cols[0]:
+    st.metric("Launched items found", len(launched))
+with cols[1]:
+    st.caption(f"Scraped at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+with cols[2]:
+    st.caption("If Microsoft changes the page layout, selectors may need updates.")
 
 st.divider()
 
-# ---- Rendering ---------------------------------------------------------------
-if not launched_entries:
-    st.info("No 'Launched' items found in the current feed.")
+# ----------------------------- Render -----------------------------------------
+if not launched:
+    st.info("No 'Launched' items detected on the page.")
 else:
-    for e in launched_entries:
-        pub_dt = entry_published_dt(e)
-        title = e.get("title", "Untitled")
-        link = e.get("link") or e.get("id") or ""
-        tags = ", ".join([t.get("term", "") for t in e.get("tags", []) if t.get("term")])
-
+    for u in launched:
         with st.container():
-            st.subheader(f"{title}")
-            meta_cols = st.columns([1.2, 1, 1])
+            st.subheader(u["title"])
+            meta_cols = st.columns([1.2, 1, 2])
             with meta_cols[0]:
-                if link:
-                    st.markdown(f"**Link:** {link}")
+                if u["link"]:
+                    st.markdown(f"**Link:** {u['link']}")
             with meta_cols[1]:
-                st.markdown(f"**Published:** {pub_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+                st.markdown(f"**Published:** {u['date'].strftime('%Y-%m-%d %H:%M UTC') if u['date'] else '—'}")
             with meta_cols[2]:
-                if tags:
-                    st.markdown(f"**Tags:** {tags}")
+                if u["tags"]:
+                    st.markdown("**Tags:** " + ", ".join(u["tags"]))
 
-            full_text_html = extract_fulltext_from_entry(e)
-            if full_text_html and full_text_html.strip():
-                st.markdown(html.unescape(full_text_html), unsafe_allow_html=True)
+            if u["description_html"]:
+                st.markdown(html.unescape(u["description_html"]), unsafe_allow_html=True)
             else:
-                st.warning("No full text available for this item.")
+                st.caption("_No description block found on the card; open the link for full details._")
 
             st.divider()
