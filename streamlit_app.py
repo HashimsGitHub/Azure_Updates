@@ -1,237 +1,241 @@
-import time
-from datetime import datetime, timezone
-import html
 import re
+from datetime import datetime, timezone
 import streamlit as st
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+import feedparser
+import requests
 from bs4 import BeautifulSoup
 
-# Filtered "Launched" URL
-UPDATES_URL = 'https://azure.microsoft.com/en-us/updates?filters=["Launched"]'
+# Azure Updates RSS Feed
+RSS_URL = 'https://www.microsoft.com/releasecommunications/api/v2/azure/rss'
 
 st.set_page_config(page_title="Azure Updates — Launched", page_icon="🚀", layout="wide")
-st.title("🚀 Azure Updates — Launched (Newest → Oldest)")
-st.caption("Source: Azure Updates (filtered to Launched)")
+st.title("🚀 Azure Updates — All Updates (Newest → Oldest)")
+st.caption("Source: Azure Release Communications RSS Feed")
 
 # ----------------------------- Helpers ----------------------------------------
 @st.cache_data(ttl=60 * 30, show_spinner=False)  # cache for 30 minutes
-def fetch_updates_page(url: str) -> str:
-    """
-    Fetch the Azure Updates page using Playwright to handle dynamic content.
-    """
+def fetch_rss_feed(url: str):
+    """Fetch and parse the Azure RSS feed."""
     try:
-        with sync_playwright() as p:
-            # Launch browser in headless mode
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            )
-            page = context.new_page()
-            
-            # Navigate to the page
-            page.goto(url, wait_until='networkidle', timeout=30000)
-            
-            # Wait for content to load - try multiple possible selectors
-            try:
-                page.wait_for_selector('article, div[class*="update"], a[href*="/updates/"]', timeout=15000)
-            except PlaywrightTimeout:
-                st.warning("Page took longer than expected to load. Proceeding anyway...")
-            
-            # Scroll to trigger lazy loading
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(2)
-            
-            # Get the HTML content
-            html_content = page.content()
-            
-            browser.close()
-            return html_content
-            
+        feed = feedparser.parse(url)
+        return feed
     except Exception as e:
-        st.error(f"Error fetching page: {e}")
+        st.error(f"Error fetching RSS feed: {e}")
+        return None
+
+def clean_html(html_content: str) -> str:
+    """Remove HTML tags and clean up text."""
+    if not html_content:
         return ""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    # Remove script and style elements
+    for script in soup(["script", "style"]):
+        script.decompose()
+    text = soup.get_text()
+    # Clean up whitespace
+    lines = (line.strip() for line in text.splitlines())
+    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+    text = ' '.join(chunk for chunk in chunks if chunk)
+    return text
 
-def parse_updates(html_text: str):
-    """
-    Parse the Azure Updates page and return a list of dicts.
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-    updates = []
+def parse_feed_entry(entry):
+    """Parse a single RSS feed entry into structured data."""
+    # Title
+    title = entry.get('title', 'Untitled')
     
-    # Find all links to individual update pages
-    update_links = soup.select('a[href*="/updates/"]')
+    # Link
+    link = entry.get('link', '')
     
-    seen_links = set()
+    # Published date
+    date_dt = None
+    if 'published_parsed' in entry and entry.published_parsed:
+        try:
+            date_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+        except:
+            pass
     
-    for link in update_links:
-        href = link.get("href", "")
-        if not href or href in seen_links:
-            continue
-        
-        # Skip navigation links, just focus on actual updates
-        if '/updates/?query=' in href or '/updates/#' in href or href.endswith('/updates/') or href.endswith('/updates'):
-            continue
-            
-        seen_links.add(href)
-        
-        # Get title
-        title = link.get_text(strip=True)
-        if not title or len(title) < 5:
-            continue
-        
-        full_link = href if href.startswith("http") else "https://azure.microsoft.com" + href
-        
-        # Find the parent container (walk up the tree)
-        container = link
-        for _ in range(6):
-            if container and container.parent:
-                container = container.parent
-                # Stop at likely container elements
-                if container.name in ['article', 'li'] or (
-                    container.name == 'div' and container.get('class') and 
-                    any('card' in c.lower() or 'item' in c.lower() for c in container.get('class', []))
-                ):
-                    break
-        
-        # Extract status
-        status_el = container.select_one('[class*="status"], [class*="badge"], span[class*="tag"]')
-        status = status_el.get_text(strip=True) if status_el else "Launched"
-        
-        # Extract date
-        date_dt = None
-        
-        # Try <time> element first
-        time_el = container.select_one("time")
-        if time_el:
-            dt_str = time_el.get("datetime") or time_el.get_text(strip=True)
-            try:
-                # Handle ISO format
-                date_dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-            except:
-                # Try parsing text date
-                for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %Y", "%b %Y", "%Y-%m-%d"):
-                    try:
-                        date_dt = datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc)
-                        break
-                    except:
-                        continue
-        
-        # Fallback: search container text for dates
-        if not date_dt:
-            container_text = container.get_text()
-            date_patterns = [
-                (r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b', "%B %d, %Y"),
-                (r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\b', "%b %d, %Y"),
-                (r'\b\d{4}-\d{2}-\d{2}\b', "%Y-%m-%d"),
-            ]
-            for pattern, fmt in date_patterns:
-                match = re.search(pattern, container_text)
-                if match:
-                    try:
-                        date_dt = datetime.strptime(match.group(0).replace(',', ''), fmt).replace(tzinfo=timezone.utc)
-                        break
-                    except:
-                        continue
-        
-        if not date_dt:
-            date_dt = datetime.now(timezone.utc)
-        
-        # Extract tags/categories
-        tag_elements = container.select('[class*="category"], [class*="tag"]:not([class*="status"]), [class*="chip"]')
-        tags = []
-        for tag_el in tag_elements:
-            tag_text = tag_el.get_text(strip=True)
-            if tag_text and len(tag_text) < 50 and tag_text.lower() not in ['launched', 'preview', 'available']:
-                tags.append(tag_text)
-        tags = list(dict.fromkeys(tags))  # Remove duplicates while preserving order
-        
-        # Extract description
-        desc_el = container.select_one('p, div[class*="description"], div[class*="summary"], div[class*="excerpt"]')
-        description_html = str(desc_el) if desc_el else ""
-        
-        updates.append({
-            "status": status,
-            "title": title,
-            "date": date_dt,
-            "tags": tags,
-            "link": full_link,
-            "description_html": description_html
-        })
+    if not date_dt and 'published' in entry:
+        try:
+            date_dt = datetime.fromisoformat(entry.published.replace('Z', '+00:00'))
+        except:
+            pass
     
-    return updates
-
-def is_launched(status_text: str) -> bool:
-    """Check if status indicates launched/available."""
-    return bool(re.search(r"\b(launched|available|ga|general availability)\b", (status_text or "").lower()))
+    if not date_dt:
+        date_dt = datetime.now(timezone.utc)
+    
+    # Summary/Description
+    summary_html = entry.get('summary', '')
+    summary_text = clean_html(summary_html)
+    
+    # Content (might be more complete than summary)
+    content_html = ''
+    if 'content' in entry and entry.content:
+        content_html = entry.content[0].value if isinstance(entry.content, list) else entry.content
+    
+    description = content_html if content_html else summary_html
+    description_text = clean_html(description)
+    
+    # Tags/Categories
+    tags = []
+    if 'tags' in entry:
+        tags = [tag.term for tag in entry.tags if hasattr(tag, 'term')]
+    
+    # Try to extract status from title or content
+    status = "Update"
+    status_patterns = [
+        (r'\b(generally available|GA)\b', 'Generally Available'),
+        (r'\b(public preview)\b', 'Public Preview'),
+        (r'\b(private preview)\b', 'Private Preview'),
+        (r'\b(launched?)\b', 'Launched'),
+        (r'\b(available)\b', 'Available'),
+        (r'\b(retired?|retirement)\b', 'Retired'),
+    ]
+    
+    search_text = f"{title} {description_text}".lower()
+    for pattern, status_name in status_patterns:
+        if re.search(pattern, search_text, re.IGNORECASE):
+            status = status_name
+            break
+    
+    return {
+        'title': title,
+        'link': link,
+        'date': date_dt,
+        'status': status,
+        'tags': tags,
+        'description_html': description,
+        'description_text': description_text[:500],  # First 500 chars
+    }
 
 # ----------------------------- Fetch & Parse ----------------------------------
-with st.spinner("Fetching Azure Updates (this may take 10-20 seconds)…"):
-    try:
-        html_text = fetch_updates_page(UPDATES_URL)
-        if not html_text:
-            st.error("Failed to fetch page content.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Failed to load the updates page: {e}")
-        st.info("💡 Make sure Playwright is installed: `pip install playwright && playwright install chromium`")
+with st.spinner("Fetching Azure Updates from RSS feed…"):
+    feed = fetch_rss_feed(RSS_URL)
+    
+    if not feed or not feed.entries:
+        st.error("Failed to fetch RSS feed or no entries found.")
+        st.info("The RSS feed might be temporarily unavailable. Try again later.")
         st.stop()
 
-updates = parse_updates(html_text)
+# Parse all entries
+updates = [parse_feed_entry(entry) for entry in feed.entries]
 
-# Filter and sort
-launched = [u for u in updates if is_launched(u.get("status", "Launched")) or "Launched" in UPDATES_URL]
-# Remove duplicates by link
-seen = set()
-unique_launched = []
-for u in launched:
-    if u["link"] not in seen:
-        seen.add(u["link"])
-        unique_launched.append(u)
-launched = unique_launched
+# Sort by date (newest first)
+updates.sort(key=lambda x: x['date'], reverse=True)
 
-# Sort newest → oldest
-launched.sort(key=lambda x: x["date"], reverse=True)
+# ----------------------------- Filters ----------------------------------------
+st.sidebar.header("🔍 Filters")
+
+# Status filter
+all_statuses = sorted(set(u['status'] for u in updates))
+selected_statuses = st.sidebar.multiselect(
+    "Filter by Status",
+    options=all_statuses,
+    default=all_statuses
+)
+
+# Date range filter
+if updates:
+    min_date = min(u['date'] for u in updates).date()
+    max_date = max(u['date'] for u in updates).date()
+    
+    date_range = st.sidebar.date_input(
+        "Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+    
+    # Handle single date vs range
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date = end_date = date_range if not isinstance(date_range, tuple) else date_range[0]
+
+# Search filter
+search_query = st.sidebar.text_input("🔎 Search in title/description")
+
+# Apply filters
+filtered_updates = updates
+
+if selected_statuses:
+    filtered_updates = [u for u in filtered_updates if u['status'] in selected_statuses]
+
+if updates:
+    filtered_updates = [
+        u for u in filtered_updates 
+        if start_date <= u['date'].date() <= end_date
+    ]
+
+if search_query:
+    query_lower = search_query.lower()
+    filtered_updates = [
+        u for u in filtered_updates 
+        if query_lower in u['title'].lower() or query_lower in u['description_text'].lower()
+    ]
 
 # ----------------------------- Header -----------------------------------------
-cols = st.columns([1, 1, 2])
+cols = st.columns([1, 1, 1, 1])
 with cols[0]:
-    st.metric("Launched items found", len(launched))
+    st.metric("Total Updates", len(updates))
 with cols[1]:
-    st.caption(f"Scraped at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    st.metric("Filtered", len(filtered_updates))
 with cols[2]:
-    if st.button("🔄 Refresh Data"):
+    st.caption(f"Scraped: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+with cols[3]:
+    if st.button("🔄 Refresh"):
         st.cache_data.clear()
         st.rerun()
 
 st.divider()
 
 # ----------------------------- Render -----------------------------------------
-if not launched:
-    st.warning("No 'Launched' items detected. The page structure may have changed.")
-    st.info("💡 Try the refresh button or check https://azure.microsoft.com/en-us/updates manually.")
+if not filtered_updates:
+    st.info("No updates match your current filters. Try adjusting the filters in the sidebar.")
 else:
-    for idx, u in enumerate(launched):
+    for idx, update in enumerate(filtered_updates):
         with st.container():
-            col1, col2 = st.columns([4, 1])
+            # Header row
+            col1, col2 = st.columns([5, 1])
             with col1:
-                st.subheader(f"{idx + 1}. {u['title']}")
+                st.subheader(f"{idx + 1}. {update['title']}")
             with col2:
-                st.markdown(f"[🔗 View]({u['link']})")
+                if update['link']:
+                    st.markdown(f"[🔗 View]({update['link']})")
             
-            meta_cols = st.columns([1, 1, 2])
+            # Metadata row
+            meta_cols = st.columns([2, 2, 3])
             with meta_cols[0]:
-                date_str = u['date'].strftime('%b %d, %Y') if u['date'] else '—'
-                st.caption(f"📅 {date_str}")
+                date_str = update['date'].strftime('%b %d, %Y')
+                st.caption(f"📅 **Date:** {date_str}")
             with meta_cols[1]:
-                st.caption(f"🏷️ {u['status']}")
+                status_colors = {
+                    'Generally Available': '🟢',
+                    'Launched': '🟢',
+                    'Available': '🟢',
+                    'Public Preview': '🔵',
+                    'Private Preview': '🟡',
+                    'Retired': '🔴',
+                }
+                icon = status_colors.get(update['status'], '⚪')
+                st.caption(f"{icon} **Status:** {update['status']}")
             with meta_cols[2]:
-                if u["tags"]:
-                    st.caption("**Categories:** " + ", ".join(u["tags"][:5]))
-
-            if u["description_html"]:
-                try:
-                    st.markdown(html.unescape(u["description_html"]), unsafe_allow_html=True)
-                except:
-                    st.caption("_Description available at link_")
+                if update['tags']:
+                    tags_str = ", ".join(update['tags'][:3])
+                    if len(update['tags']) > 3:
+                        tags_str += f" +{len(update['tags']) - 3} more"
+                    st.caption(f"🏷️ **Tags:** {tags_str}")
+            
+            # Description
+            if update['description_text']:
+                with st.expander("📄 View Description", expanded=False):
+                    # Show cleaned text version
+                    st.write(update['description_text'])
+                    if len(update['description_text']) >= 499:
+                        st.caption("_Click the link above for full details_")
             
             st.divider()
+
+# ----------------------------- Footer -----------------------------------------
+st.sidebar.divider()
+st.sidebar.caption(f"💾 Data cached for 30 minutes")
+st.sidebar.caption(f"📊 Feed contains {len(feed.entries)} total entries")
