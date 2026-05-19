@@ -2,7 +2,7 @@
 
 A Streamlit web app that tracks **newly launched Azure services and features** in real time, pulling directly from Microsoft's official Azure Release Communications RSS feed.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://azure-updates.streamlit.app/)
+[![Streamlit App](https://img.shields.io/badge/Streamlit-App-FF4B4B?logo=streamlit&logoColor=white)](https://azure-updates.streamlit.app/)
 
 ---
 
